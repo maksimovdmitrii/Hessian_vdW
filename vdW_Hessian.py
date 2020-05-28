@@ -1,5 +1,3 @@
-#!/usr/bin/python3
-
 import numpy as np
 from ase.io import read, write
 from ase.constraints import Filter, FixAtoms
@@ -9,9 +7,11 @@ from itertools import product
 
 import optparse
 parser = optparse.OptionParser()
-parser.add_option("-i", "--informat", dest="informat", default='aims',
+parser.add_option("-f", "--formatfile", dest="formatfile", default='aims',
                     help="Input format extension ")
-parser.add_option("-g", "--geometry", dest="geometry", help="geometry file")
+parser.add_option("-i", "--inputfile", dest="inputfile", help="input geometry file")
+parser.add_option("-o", "--outputfile", dest="outputfile", help="output Hessian file")
+#parser.add_option("-m", "--multiplier", dest="multiplier", help="vdW multiplier for C6 coeff")
 options, args = parser.parse_args()
 
 
@@ -25,9 +25,12 @@ options, args = parser.parse_args()
 #    !single double theory with accrate basis. The vdW radii for respective element are
 #    !defined as discussed in Tkatchenko, A. & Scheffler, M. Phys. Rev. Lett. 102, 073005 (2009).
 
-ABOHR = 0.52917721   # in AA
-HARTREE = 27.211383  # in eV
+BOHR_to_angstr = 0.52917721   # in AA
+HARTREE_to_eV = 27.211383  # in eV
+HARTREE_to_kcal_mol = 627.509 # in kcal * mol^(-1)
 
+# Ground state polarizabilities α0 (in atomic units) of noble gases and isoelectronic ions. 
+# https://iopscience.iop.org/article/10.1088/0953-4075/43/20/202001/pdf
 ALPHA_vdW = {'H': 4.5000, 'He': 1.3800, 'Li': 164.2000, 'Be': 38.0000, 'B': 21.0000, 'C': 12.0000,
                 'N': 7.4000, 'O': 5.4000, 'F': 3.8000, 'Ne': 2.6700, 'Na': 162.7000, 'Mg': 71.0000, 'Al': 60.0000,
                 'Si': 37.0000, 'P': 25.0000, 'S': 19.6000, 'Cl': 15.0000, 'Ar': 11.1000, 'K': 292.9000,
@@ -131,16 +134,13 @@ def vector_separation(cell_h, cell_ih, qi, qj):
     return dij, rij
 
 
-atoms = read(options.geometry, format = options.informat)
+atoms = read(options.inputfile, format = options.formatfile)
 
 N  = len(atoms)
 coordinates = atoms.get_positions()
 atom_names = atoms.get_chemical_symbols()
 cell_h = atoms.get_cell()[:]
 cell_ih = atoms.get_reciprocal_cell()[:]
-
-
-
 
 def calculate_vdW(i, j, rij, coordinates, atom_names):
     
@@ -151,17 +151,25 @@ def calculate_vdW(i, j, rij, coordinates, atom_names):
         pairs = product(range(3), repeat=2)
         block = np.array([(coord[i_ind][k[0]] - coord[j_ind][k[0]])
                  * (coord[i_ind][k[1]] - coord[j_ind][k[1]]) for k in pairs])
-        return C6_coeff * ((-48 / dist ** 10) + (168 / dist ** 16)) * block
+        return C6_coeff * ((-48 / dist ** 10) + (168 / dist ** 16)) * block 
 
-    ## # C6 coefficient for atoms A and B
-    C6i = C6_vdW[atom_names[i]] * (HARTREE * ABOHR ** 6) 
-    C6j = [C6_vdW[atom_names[a]] * (HARTREE * ABOHR ** 6) for a in j]
-    alphai = ALPHA_vdW[atom_names[i]] * (ABOHR ** 3) 
-    alphaj = [ALPHA_vdW[atom_names[a]] * (ABOHR ** 3) for a in j]
+    
+
+    # C6 coefficient for atoms A and B
+    C6i = C6_vdW[atom_names[i]]
+    C6j = [C6_vdW[atom_names[a]] for a in j]     
+    
+    # polarizabilities α
+    alphai = ALPHA_vdW[atom_names[i]]  
+    alphaj = [ALPHA_vdW[atom_names[a]]  for a in j]
+    
+      
+    units = HARTREE_to_eV * (BOHR_to_angstr ** 6)
     
     C6AB = [(2 * C6i * C6j[z]) 
             / (alphaj[z] / alphai * C6i
-                + alphai / alphaj[z] * C6j[z])
+                + alphai / alphaj[z] * C6j[z]) 
+            * units
             for z in range(len(j))]
 
     blocks = [(np.identity(3).reshape(1, -1) * C6AB[n] *
@@ -176,7 +184,11 @@ hessian = np.zeros(shape = (3 * N, 3 * N))
 for i in range(N-1):
     qi = coordinates[i].reshape(1,3)
     qj = coordinates[i+1:].reshape(-1,3)
-    dij, rij = vector_separation(cell_h, cell_ih, qi, qj)
+    
+    if np.array_equal(cell_h,np.zeros([3, 3])):
+        rij = np.array([np.linalg.norm(qi-Qj) for Qj in qj])
+    else:
+        dij, rij = vector_separation(cell_h, cell_ih, qi, qj) 
     
     j = range(N)[i+1:]
     stack = calculate_vdW(i, j, rij, coordinates, atom_names)
@@ -184,11 +196,14 @@ for i in range(N-1):
     hessian[3 * i + 1, 3 * (i+1):] = stack[1]
     hessian[3 * i + 2, 3 * (i+1):] = stack[2]
     
+# Fill lower triangle
 hessian = hessian + hessian.T - np.diag(hessian.diagonal())
-for ind in range(len(hessian)):
-    hessian[ind, ind] = -np.sum(hessian[ind])
 
-with open("Hessian_vdW.dat", 'w') as hes:
+# Regularization
+for ind in range(len(hessian)):
+    hessian[ind, ind] = hessian[ind, ind] + 0.5
+
+with open(options.outputfile, 'w') as hes:
     for i in hessian:
         hes.write(' '.join(["{:8.3f}".format(k) for k in i]))
         hes.write('\n')
